@@ -1,0 +1,43 @@
+# Environment variables - NEVER commit these!
+.env.local
+.env.*.local
+
+# Dependencies
+node_modules
+pnpm-lock.yaml
+npm-lock.json
+yarn.lock
+
+# Build outputs
+dist
+build
+*.tsbuildinfo
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Testing
+coverage
+.nyc_output
+
+# Temporary files
+*.tmp
+*.temp
+.vercel
