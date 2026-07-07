@@ -8,7 +8,31 @@
   },
   "scripts": {
     "build": "vite build",
-    "dev": "vite"
+    "dev": "vite",
+    "db:validate": "node scripts/infrastructure/validate.mjs",
+    "db:migrate": "node scripts/infrastructure/migrate.mjs",
+    "db:migrate:staging": "node scripts/infrastructure/migrate.mjs --env staging",
+    "db:migrate:production": "node scripts/infrastructure/migrate.mjs --env production",
+    "db:rollback": "node scripts/infrastructure/rollback.mjs",
+    "db:status": "node scripts/infrastructure/status.mjs",
+    "db:seed": "node scripts/infrastructure/seed.mjs",
+    "db:bootstrap": "node scripts/infrastructure/bootstrap.mjs",
+    "db:backfill": "node scripts/infrastructure/backfill.mjs",
+    "db:backfill:verify": "node scripts/infrastructure/verify-backfill.mjs",
+    "db:backfill:rollback": "node scripts/infrastructure/rollback-backfill.mjs",
+    "db:health": "node scripts/infrastructure/health.mjs",
+    "db:repair": "node scripts/infrastructure/repair.mjs",
+    "db:cutover": "node scripts/infrastructure/cutover.mjs",
+    "db:flag": "node scripts/infrastructure/toggle-flag.mjs",
+    "db:pilot": "node scripts/infrastructure/pilot-shop.mjs",
+    "release:evaluate": "node scripts/infrastructure/release-evaluate.mjs",
+    "test:infrastructure": "node scripts/infrastructure/test.mjs",
+    "test:auth": "vitest run",
+    "test:provisioning": "vitest run src/lib/provisioning",
+    "golden-path": "node scripts/golden-path/run.mjs",
+    "test:auth:coverage": "vitest run --coverage",
+    "validate:auth": "node scripts/infrastructure/validate-auth-architecture.mjs",
+    "test": "npm run test:infrastructure && npm run test:auth && npm run validate:auth"
   },
 
   "dependencies": {
@@ -74,10 +98,14 @@
   },
   "devDependencies": {
     "@tailwindcss/vite": "4.1.12",
+    "@testing-library/react": "^16.3.0",
     "@vitejs/plugin-react": "4.7.0",
+    "@vitest/coverage-v8": "^3.2.4",
+    "jsdom": "^26.1.0",
     "pg": "^8.22.0",
     "tailwindcss": "4.1.12",
-    "vite": "6.3.5"
+    "vite": "6.3.5",
+    "vitest": "^3.2.4"
   },
   "peerDependencies": {
     "react": "18.3.1",

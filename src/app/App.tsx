@@ -18,7 +18,8 @@ import {
   PieChart, Pie, Cell, LineChart, Line, CartesianGrid, Legend,
 } from "recharts";
 import { useShopData } from "../lib/useShopData";
-import { fetchShops, fetchShopById, addShop, updateShop, signIn, signOut, getAuthUser } from "../lib/database";
+import { fetchShops, fetchShopById, addShop, updateShop, ShopFetchError } from "../lib/database";
+import { signIn, signOut, getAuthUser } from "../lib/auth";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -390,7 +391,7 @@ function ProductModal({
 }: {
   product?: Product;
   onClose: () => void;
-  onSave: (data: Omit<Product, "id">) => void;
+  onSave: (data: Omit<Product, "id">) => Promise<boolean>;
 }) {
   const [form, setForm] = useState<ProductFormData>({
     name: product?.name ?? "",
@@ -401,21 +402,48 @@ function ProductModal({
     emoji: product?.emoji ?? "🍬",
     lowStockThreshold: product?.lowStockThreshold?.toString() ?? "10",
   });
+  const [formErr, setFormErr] = useState("");
+  const [isSaving, setIsSaving] = useState(false);
 
   const set = (k: keyof ProductFormData) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) =>
     setForm((f) => ({ ...f, [k]: e.target.value }));
 
-  const handleSave = () => {
-    if (!form.name || !form.price) return;
-    onSave({
-      name: form.name, nameHi: form.nameHi,
-      category: form.category,
-      price: parseFloat(form.price),
-      unit: form.unit,
-      stock: 0, // stock is always batch-derived; never manually set
-      emoji: form.emoji,
-      lowStockThreshold: parseInt(form.lowStockThreshold) || 10,
-    });
+  const handleSave = async () => {
+    if (!form.name.trim()) {
+      setFormErr("Product name is required.");
+      return;
+    }
+    if (!form.price.trim() || Number(form.price) <= 0) {
+      setFormErr("Price must be a positive number.");
+      return;
+    }
+    if (!form.unit.trim()) {
+      setFormErr("Unit is required.");
+      return;
+    }
+
+    setFormErr("");
+    setIsSaving(true);
+    try {
+      const success = await onSave({
+        name: form.name.trim(), nameHi: form.nameHi.trim(),
+        category: form.category,
+        price: parseFloat(form.price),
+        unit: form.unit.trim(),
+        stock: 0, // stock is always batch-derived; never manually set
+        emoji: form.emoji,
+        lowStockThreshold: parseInt(form.lowStockThreshold) || 10,
+      });
+      if (success) {
+        onClose();
+      } else {
+        setFormErr("Unable to save product. Please try again.");
+      }
+    } catch (err) {
+      setFormErr(err instanceof Error ? err.message : "Unable to save product. Please try again.");
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   return (
@@ -452,8 +480,8 @@ function ProductModal({
               </select>
             </div>
             <div>
-              <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wide block mb-1">Unit</label>
-              <input value={form.unit} onChange={set("unit")} placeholder="500g / piece / plate"
+              <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wide block mb-1">Unit *</label>
+              <input value={form.unit} onChange={set("unit")} placeholder="500g / piece / plate" required
                 className="w-full px-3 py-2 rounded-lg bg-input-background border border-border text-sm focus:outline-none focus:ring-2 focus:ring-ring" />
             </div>
             <div>
@@ -473,11 +501,17 @@ function ProductModal({
               </div>
             </div>
           </div>
+          {formErr ? (
+            <p className="px-6 pb-2 text-sm text-destructive flex items-center gap-1.5">
+              <AlertCircle size={14} />{formErr}
+            </p>
+          ) : null}
         </div>
         <div className="px-6 pb-5 flex gap-3 justify-end">
           <button onClick={onClose} className="px-4 py-2 rounded-lg border border-border text-sm hover:bg-muted transition-colors">Cancel</button>
-          <button onClick={handleSave} className="px-4 py-2 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:opacity-90 transition-opacity flex items-center gap-2">
-            <Save size={14} /> {product ? "Update" : "Add Product"}
+          <button onClick={handleSave} disabled={isSaving}
+            className="px-4 py-2 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:opacity-90 transition-opacity flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed">
+            <Save size={14} /> {isSaving ? (product ? "Updating..." : "Saving...") : product ? "Update" : "Add Product"}
           </button>
         </div>
       </div>
@@ -935,9 +969,9 @@ function BatchModal({
   product: Product;
   batches: Batch[];
   onClose: () => void;
-  onAddBatch: (b: Batch) => void;
+  onAddBatch: (b: Batch) => Promise<boolean>;
   onDeleteBatch: (id: string) => void;
-  onWaste: (entry: WastageEntry) => void;
+  onWaste: (entry: Omit<WastageEntry, "id">, batch: Batch) => Promise<boolean>;
 }) {
   const requiresExpiry = EXPIRY_CATEGORIES.has(product.category);
   const cutoff = CUTOFF_DAYS[product.category] ?? 0;
@@ -948,10 +982,12 @@ function BatchModal({
     quantity: "", costPrice: "",
   });
   const [formErr, setFormErr] = useState("");
-  // Wastage confirmation state: batchId being wasted
   const [wastingId, setWastingId] = useState<string | null>(null);
   const [wasteReason, setWasteReason] = useState<WastageReason>("expired");
   const [wasteNotes, setWasteNotes] = useState("");
+  const [wasteQty, setWasteQty] = useState("");
+  const [wasteErr, setWasteErr] = useState("");
+  const [isWasting, setIsWasting] = useState(false);
 
   const confirmWaste = (batch: Batch) => {
     const autoReason: WastageReason =
@@ -959,12 +995,17 @@ function BatchModal({
       batch.status === "unsellable" ? "near-expiry-cutoff" : "other";
     setWasteReason(autoReason);
     setWasteNotes("");
+    setWasteQty(String(batch.quantity));
+    setWasteErr("");
     setWastingId(batch.id);
   };
 
-  const submitWaste = (batch: Batch) => {
-    const entry: WastageEntry = {
-      id: `WST-${Date.now()}`,
+  const submitWaste = async (batch: Batch) => {
+    const qty = parseInt(wasteQty, 10);
+    if (!qty || qty <= 0) { setWasteErr("Enter a valid quantity."); return; }
+    if (qty > batch.quantity) { setWasteErr(`Cannot waste more than ${batch.quantity} units.`); return; }
+
+    const entry: Omit<WastageEntry, "id"> = {
       date: todayISO, time: nowTime(),
       productId: product.id,
       productName: product.name,
@@ -973,21 +1014,31 @@ function BatchModal({
       batchNo: batch.batchNo,
       batchId: batch.id,
       expiryDate: batch.expiryDate,
-      quantity: batch.quantity,
+      quantity: qty,
       costPrice: batch.costPrice,
-      totalLoss: batch.quantity * batch.costPrice,
+      totalLoss: qty * batch.costPrice,
       reason: wasteReason,
       notes: wasteNotes.trim(),
     };
-    onWaste(entry);
-    onDeleteBatch(batch.id);
+
+    setIsWasting(true);
+    setWasteErr("");
+    const success = await onWaste(entry, batch);
+    setIsWasting(false);
+
+    if (!success) {
+      setWasteErr("Unable to record wastage. Please try again.");
+      return;
+    }
     setWastingId(null);
   };
 
   const setF = (k: keyof typeof form) => (e: React.ChangeEvent<HTMLInputElement>) =>
     setForm(f => ({ ...f, [k]: e.target.value }));
 
-  const handleAdd = () => {
+  const [isSaving, setIsSaving] = useState(false);
+
+  const handleAdd = async () => {
     if (!form.batchNo.trim()) { setFormErr("Batch number is required."); return; }
     if (!form.expiryDate) { setFormErr("Expiry date is required."); return; }
     if (!form.quantity || parseInt(form.quantity) <= 0) { setFormErr("Quantity must be > 0."); return; }
@@ -1002,7 +1053,16 @@ function BatchModal({
       status: "active",
     };
     newBatch.status = computeBatchStatus(newBatch, product.category);
-    onAddBatch(newBatch);
+
+    setIsSaving(true);
+    const success = await onAddBatch(newBatch);
+    setIsSaving(false);
+
+    if (!success) {
+      setFormErr("Unable to save batch. Please try again.");
+      return;
+    }
+
     setForm({ batchNo: "", mfgDate: "", expiryDate: "", quantity: "", costPrice: "" });
     setShowForm(false);
     setFormErr("");
@@ -1124,9 +1184,9 @@ function BatchModal({
               <div className="flex gap-2">
                 <button onClick={() => { setShowForm(false); setFormErr(""); }}
                   className="px-4 py-2 rounded-lg border border-border text-sm hover:bg-muted transition-colors">Cancel</button>
-                <button onClick={handleAdd}
-                  className="px-4 py-2 rounded-lg bg-primary text-primary-foreground text-sm font-semibold hover:opacity-90 transition-opacity flex items-center gap-1.5">
-                  <Check size={13} /> Add Batch
+                <button onClick={handleAdd} disabled={isSaving}
+                  className="px-4 py-2 rounded-lg bg-primary text-primary-foreground text-sm font-semibold hover:opacity-90 transition-opacity flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed">
+                  <Check size={13} /> {isSaving ? "Adding…" : "Add Batch"}
                 </button>
               </div>
             </div>
@@ -1231,6 +1291,12 @@ function BatchModal({
                           </p>
                         )}
                         <div>
+                          <label className="text-xs font-semibold text-muted-foreground block mb-1">Quantity to waste</label>
+                          <input type="number" min={1} max={batch.quantity} value={wasteQty}
+                            onChange={e => { setWasteQty(e.target.value); setWasteErr(""); }}
+                            className="w-full px-3 py-1.5 rounded-lg bg-white border border-border text-xs focus:outline-none focus:ring-2 focus:ring-ring" />
+                        </div>
+                        <div>
                           <label className="text-xs font-semibold text-muted-foreground block mb-1">Reason</label>
                           <select value={wasteReason}
                             onChange={e => setWasteReason(e.target.value as WastageReason)}
@@ -1246,12 +1312,13 @@ function BatchModal({
                             placeholder="e.g. Found mould, packaging torn…"
                             className="w-full px-3 py-1.5 rounded-lg bg-white border border-border text-xs focus:outline-none focus:ring-2 focus:ring-ring" />
                         </div>
+                        {wasteErr && <p className="text-xs text-destructive">{wasteErr}</p>}
                         <div className="flex gap-2">
-                          <button onClick={() => setWastingId(null)}
+                          <button onClick={() => setWastingId(null)} disabled={isWasting}
                             className="flex-1 py-1.5 rounded-lg border border-border text-xs font-semibold hover:bg-muted transition-colors">Cancel</button>
-                          <button onClick={() => submitWaste(batch)}
-                            className="flex-1 py-1.5 rounded-lg bg-destructive text-destructive-foreground text-xs font-semibold hover:opacity-90 transition-opacity flex items-center justify-center gap-1">
-                            <Recycle size={11} /> Confirm Wastage
+                          <button onClick={() => submitWaste(batch)} disabled={isWasting}
+                            className="flex-1 py-1.5 rounded-lg bg-destructive text-destructive-foreground text-xs font-semibold hover:opacity-90 transition-opacity flex items-center justify-center gap-1 disabled:opacity-60">
+                            <Recycle size={11} /> {isWasting ? "Saving…" : "Confirm Wastage"}
                           </button>
                         </div>
                       </div>
@@ -1292,10 +1359,10 @@ function ProductDetailPage({
   onBack: () => void;
   onUpdateProduct: (data: Omit<Product, "id">) => void;
   onDeleteProduct: () => void;
-  onAddBatch: (b: Batch) => void;
+  onAddBatch: (b: Batch) => Promise<boolean>;
   onDeleteBatch: (id: string) => void;
   onUpdateBatch: (id: string, changes: Partial<Batch>) => void;
-  onWaste: (entry: WastageEntry) => void;
+  onWaste: (entry: Omit<WastageEntry, "id">, batch: Batch) => Promise<boolean>;
 }) {
   const [tab, setTab] = useState<DetailTab>("info");
   const hasExpiry = EXPIRY_CATEGORIES.has(product.category);
@@ -1321,10 +1388,13 @@ function ProductDetailPage({
     setBatchForm(f => ({ ...f, [k]: e.target.value }));
   const [batchErr, setBatchErr] = useState("");
 
-  const handleAddBatch = () => {
-    if (!batchForm.batchNo.trim()) { setBatchErr("Batch number required."); return; }
-    if (!batchForm.expiryDate) { setBatchErr("Expiry date required."); return; }
-    if (!batchForm.quantity || parseInt(batchForm.quantity) <= 0) { setBatchErr("Quantity must be > 0."); return; }
+  const [isAddingBatch, setIsAddingBatch] = useState(false);
+
+  const handleAddBatch = async () => {
+    if (!batchForm.batchNo.trim()) { setBatchErr("Batch number is required."); return; }
+    if (!batchForm.mfgDate) { setBatchErr("Manufacture date is required."); return; }
+    if (!batchForm.expiryDate) { setBatchErr("Expiry date is required."); return; }
+    if (!batchForm.quantity || parseInt(batchForm.quantity) <= 0) { setBatchErr("Quantity must be greater than 0."); return; }
     const b: Batch = {
       id: `B-${Date.now()}`,
       batchNo: batchForm.batchNo.trim(),
@@ -1337,7 +1407,16 @@ function ProductDetailPage({
       status: "active",
     };
     b.status = computeBatchStatus(b, product.category);
-    onAddBatch(b);
+
+    setIsAddingBatch(true);
+    const success = await onAddBatch(b);
+    setIsAddingBatch(false);
+
+    if (!success) {
+      setBatchErr("Unable to save batch. Please try again.");
+      return;
+    }
+
     setBatchForm({ batchNo: "", mfgDate: "", expiryDate: "", quantity: "", costPrice: "", notes: "" });
     setShowBatchForm(false); setBatchErr("");
   };
@@ -1356,9 +1435,41 @@ function ProductDetailPage({
   const [wastingId, setWastingId] = useState<string | null>(null);
   const [wasteReason, setWasteReason] = useState<WastageReason>("expired");
   const [wasteNotes, setWasteNotes] = useState("");
-  const submitWaste = (b: Batch) => {
-    onWaste({ id: `WST-${Date.now()}`, date: todayISO, time: nowTime(), productId: product.id, productName: product.name, productEmoji: product.emoji, category: product.category, batchNo: b.batchNo, batchId: b.id, expiryDate: b.expiryDate, quantity: b.quantity, costPrice: b.costPrice, totalLoss: b.quantity * b.costPrice, reason: wasteReason, notes: wasteNotes.trim() });
-    onDeleteBatch(b.id); setWastingId(null);
+  const [wasteQty, setWasteQty] = useState("");
+  const [wasteErr, setWasteErr] = useState("");
+  const [isWasting, setIsWasting] = useState(false);
+
+  const startWaste = (b: Batch) => {
+    setWasteReason(b.status === "expired" ? "expired" : "near-expiry-cutoff");
+    setWasteNotes("");
+    setWasteQty(String(b.quantity));
+    setWasteErr("");
+    setWastingId(b.id);
+  };
+
+  const submitWaste = async (b: Batch) => {
+    const qty = parseInt(wasteQty, 10);
+    if (!qty || qty <= 0) { setWasteErr("Enter a valid quantity."); return; }
+    if (qty > b.quantity) { setWasteErr(`Cannot waste more than ${b.quantity} units.`); return; }
+
+    const entry: Omit<WastageEntry, "id"> = {
+      date: todayISO, time: nowTime(),
+      productId: product.id, productName: product.name, productEmoji: product.emoji,
+      category: product.category, batchNo: b.batchNo, batchId: b.id, expiryDate: b.expiryDate,
+      quantity: qty, costPrice: b.costPrice, totalLoss: qty * b.costPrice,
+      reason: wasteReason, notes: wasteNotes.trim(),
+    };
+
+    setIsWasting(true);
+    setWasteErr("");
+    const success = await onWaste(entry, b);
+    setIsWasting(false);
+
+    if (!success) {
+      setWasteErr("Unable to record wastage. Please try again.");
+      return;
+    }
+    setWastingId(null);
   };
 
   // ── Stats ───────────────────────────────────────────────────────────────
@@ -1606,7 +1717,7 @@ function ProductDetailPage({
                           </button>
                         )}
                         {isBlocked && wastingId !== batch.id && (
-                          <button onClick={() => { setWasteReason(batch.status === "expired" ? "expired" : "near-expiry-cutoff"); setWasteNotes(""); setWastingId(batch.id); }}
+                          <button onClick={() => startWaste(batch)}
                             className="px-2.5 py-1.5 rounded-lg bg-red-100 border border-red-300 text-destructive text-xs font-bold hover:bg-red-200 transition-colors flex items-center gap-1">
                             <Recycle size={11} /> Wastage
                           </button>
@@ -1707,9 +1818,15 @@ function ProductDetailPage({
                     {wastingId === batch.id && (
                       <div className="mt-4 pt-4 border-t border-red-200 space-y-3">
                         <p className="text-xs font-bold text-destructive flex items-center gap-1.5">
-                          <PackageX size={12} /> Move to Wastage — {batch.quantity} units · Est. loss: {fmt(batch.quantity * batch.costPrice)}
+                          <PackageX size={12} /> Move to Wastage — up to {batch.quantity} units available
                         </p>
                         <div className="grid grid-cols-2 gap-3">
+                          <div>
+                            <label className="text-xs font-semibold text-muted-foreground block mb-1">Quantity to waste</label>
+                            <input type="number" min={1} max={batch.quantity} value={wasteQty}
+                              onChange={e => { setWasteQty(e.target.value); setWasteErr(""); }}
+                              className="w-full px-3 py-2 rounded-lg bg-white border border-border text-xs focus:outline-none focus:ring-2 focus:ring-ring" />
+                          </div>
                           <div>
                             <label className="text-xs font-semibold text-muted-foreground block mb-1">Reason</label>
                             <select value={wasteReason} onChange={e => setWasteReason(e.target.value as WastageReason)}
@@ -1717,16 +1834,17 @@ function ProductDetailPage({
                               {Object.entries(WASTAGE_REASONS).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
                             </select>
                           </div>
-                          <div>
+                          <div className="col-span-2">
                             <label className="text-xs font-semibold text-muted-foreground block mb-1">Notes</label>
                             <input value={wasteNotes} onChange={e => setWasteNotes(e.target.value)} placeholder="Optional…"
                               className="w-full px-3 py-2 rounded-lg bg-white border border-border text-xs focus:outline-none focus:ring-2 focus:ring-ring" />
                           </div>
                         </div>
+                        {wasteErr && <p className="text-xs text-destructive">{wasteErr}</p>}
                         <div className="flex gap-2">
-                          <button onClick={() => setWastingId(null)} className="px-4 py-2 rounded-lg border border-border text-sm hover:bg-muted transition-colors">Cancel</button>
-                          <button onClick={() => submitWaste(batch)} className="px-4 py-2 rounded-lg bg-destructive text-destructive-foreground text-sm font-semibold hover:opacity-90 flex items-center gap-2">
-                            <Recycle size={13} />Confirm Wastage
+                          <button onClick={() => setWastingId(null)} disabled={isWasting} className="px-4 py-2 rounded-lg border border-border text-sm hover:bg-muted transition-colors">Cancel</button>
+                          <button onClick={() => submitWaste(batch)} disabled={isWasting} className="px-4 py-2 rounded-lg bg-destructive text-destructive-foreground text-sm font-semibold hover:opacity-90 flex items-center gap-2 disabled:opacity-60">
+                            <Recycle size={13} />{isWasting ? "Saving…" : "Confirm Wastage"}
                           </button>
                         </div>
                       </div>
@@ -1762,14 +1880,14 @@ function Inventory({
   onWaste,
 }: {
   products: Product[];
-  onAdd: (p: Omit<Product, "id">) => void;
+  onAdd: (p: Omit<Product, "id">) => Promise<boolean>;
   onUpdate: (id: number, p: Omit<Product, "id">) => void;
   onDelete: (id: number) => void;
   batchMap: Record<number, Batch[]>;
-  onAddBatch: (productId: number, batch: Batch) => void;
+  onAddBatch: (productId: number, batch: Batch) => Promise<boolean>;
   onDeleteBatch: (productId: number, batchId: string) => void;
   onUpdateBatch: (productId: number, batchId: string, changes: Partial<Batch>) => void;
-  onWaste: (entry: WastageEntry) => void;
+  onWaste: (productId: number, batch: Batch, entry: Omit<WastageEntry, "id">) => Promise<boolean>;
 }) {
   const [search, setSearch] = useState("");
   const [catFilter, setCatFilter] = useState("All");
@@ -1801,7 +1919,7 @@ function Inventory({
         onAddBatch={b => onAddBatch(detailProduct.id, b)}
         onDeleteBatch={id => onDeleteBatch(detailProduct.id, id)}
         onUpdateBatch={(id, changes) => onUpdateBatch(detailProduct.id, id, changes)}
-        onWaste={onWaste}
+        onWaste={(entry, batch) => onWaste(detailProduct.id, batch, entry)}
       />
     );
   }
@@ -1941,7 +2059,19 @@ function Inventory({
         <ProductModal
           product={editProduct}
           onClose={closeModal}
-          onSave={data => { editProduct ? onUpdate(editProduct.id, data) : onAdd(data); closeModal(); }}
+          onSave={async data => {
+            if (editProduct) {
+              await onUpdate(editProduct.id, data);
+              closeModal();
+              return true;
+            }
+            const success = await onAdd(data);
+            if (success) {
+              closeModal();
+              return true;
+            }
+            return false;
+          }}
         />
       )}
       {batchProduct && (
@@ -1951,7 +2081,7 @@ function Inventory({
           onClose={() => setBatchProduct(undefined)}
           onAddBatch={b => onAddBatch(batchProduct.id, b)}
           onDeleteBatch={id => onDeleteBatch(batchProduct.id, id)}
-          onWaste={onWaste}
+          onWaste={(entry, batch) => onWaste(batchProduct.id, batch, entry)}
         />
       )}
     </div>
@@ -1965,7 +2095,7 @@ function Orders({
 }: {
   orders: Order[];
   refunds: Refund[];
-  onRefund: (refund: Refund, order: Order) => void;
+  onRefund: (refund: Refund, order: Order) => Promise<boolean>;
   shop: RegisteredShop | null;
 }) {
   const [invoiceOrder, setInvoiceOrder] = useState<Order | null>(null);
@@ -2103,7 +2233,11 @@ function Orders({
         <RefundModal
           order={refundOrder}
           onClose={() => setRefundOrder(null)}
-          onRefund={refund => { onRefund(refund, refundOrder); setRefundOrder(null); }}
+          onRefund={async refund => {
+            const success = await onRefund(refund, refundOrder);
+            if (success) setRefundOrder(null);
+            return success;
+          }}
         />
       )}
     </div>
@@ -2118,7 +2252,7 @@ type SortDir = "desc" | "asc";
 
 const CHART_COLORS = ["#B5460A", "#1B5E20", "#7B1FA2", "#F57F17", "#0277BD", "#AD1457"];
 
-function SalesRecords({ orders }: { orders: Order[] }) {
+function SalesRecords({ orders, refunds }: { orders: Order[]; refunds: Refund[] }) {
   const [dateRange, setDateRange] = useState<DateRange>("all");
   const [categoryFilter, setCategoryFilter] = useState("All");
   const [sortKey, setSortKey] = useState<SortKey>("revenue");
@@ -2126,28 +2260,46 @@ function SalesRecords({ orders }: { orders: Order[] }) {
   const [paymentFilter, setPaymentFilter] = useState("All");
   const [activeTab, setActiveTab] = useState<"products" | "daily" | "category" | "payment">("products");
 
+  const refundedOrderIds = useMemo(() => new Set(refunds.map(r => r.orderId)), [refunds]);
+
+  const inDateRange = useCallback((dateStr: string) => {
+    const now = new Date();
+    const d = new Date(dateStr);
+    if (dateRange === "today") return dateStr === now.toISOString().split("T")[0];
+    if (dateRange === "7d") return (now.getTime() - d.getTime()) <= 7 * 86400000;
+    if (dateRange === "30d") return (now.getTime() - d.getTime()) <= 30 * 86400000;
+    return true;
+  }, [dateRange]);
+
   // Filter orders by date range
   const filteredOrders = useMemo(() => {
-    const now = new Date();
     return orders.filter(o => {
-      const d = new Date(o.date);
-      if (dateRange === "today") return o.date === now.toISOString().split("T")[0];
-      if (dateRange === "7d") return (now.getTime() - d.getTime()) <= 7 * 86400000;
-      if (dateRange === "30d") return (now.getTime() - d.getTime()) <= 30 * 86400000;
-      return true;
-    }).filter(o => paymentFilter === "All" || o.paymentMode === paymentFilter);
-  }, [orders, dateRange, paymentFilter]);
+      if (!inDateRange(o.date)) return false;
+      return paymentFilter === "All" || o.paymentMode === paymentFilter;
+    });
+  }, [orders, inDateRange, paymentFilter]);
 
-  // KPIs
-  const totalRevenue = filteredOrders.reduce((s, o) => s + o.total, 0);
-  const totalDiscount = filteredOrders.reduce((s, o) => s + o.discountAmount, 0);
-  const avgOrderValue = filteredOrders.length ? totalRevenue / filteredOrders.length : 0;
-  const totalItemsSold = filteredOrders.reduce((s, o) => s + o.items.reduce((si, i) => si + i.qty, 0), 0);
+  const salesOrders = useMemo(() =>
+    filteredOrders.filter(o => !refundedOrderIds.has(o.id)),
+  [filteredOrders, refundedOrderIds]);
+
+  const filteredRefunds = useMemo(() =>
+    refunds.filter(r => inDateRange(r.date)),
+  [refunds, inDateRange]);
+
+  // KPIs (net of refunds)
+  const grossRevenue = filteredOrders.reduce((s, o) => s + o.total, 0);
+  const refundTotal = filteredRefunds.reduce((s, r) => s + r.amount, 0);
+  const netRevenue = grossRevenue - refundTotal;
+  const totalDiscount = salesOrders.reduce((s, o) => s + o.discountAmount, 0);
+  const avgOrderValue = salesOrders.length ? netRevenue / salesOrders.length : 0;
+  const totalItemsSold = salesOrders.reduce((s, o) => s + o.items.reduce((si, i) => si + i.qty, 0), 0);
 
   // Product sales aggregation
   const productStats = useMemo(() => {
     const map: Record<string, { name: string; emoji: string; category: string; qty: number; revenue: number; orders: number }> = {};
     filteredOrders.forEach(o => {
+      if (refundedOrderIds.has(o.id)) return;
       o.items.forEach(item => {
         if (categoryFilter !== "All" && item.category !== categoryFilter) return;
         if (!map[item.id]) map[item.id] = { name: item.name, emoji: item.emoji, category: item.category, qty: 0, revenue: 0, orders: 0 };
@@ -2157,7 +2309,7 @@ function SalesRecords({ orders }: { orders: Order[] }) {
       });
     });
     return Object.values(map).map(p => ({ ...p, avgOrder: p.revenue / p.orders }));
-  }, [filteredOrders, categoryFilter]);
+  }, [filteredOrders, categoryFilter, refundedOrderIds]);
 
   const sortedProducts = useMemo(() =>
     [...productStats].sort((a, b) => sortDir === "desc" ? b[sortKey] - a[sortKey] : a[sortKey] - b[sortKey]),
@@ -2174,6 +2326,10 @@ function SalesRecords({ orders }: { orders: Order[] }) {
       map[o.date].orders += 1;
       map[o.date].discount += o.discountAmount;
     });
+    filteredRefunds.forEach(r => {
+      if (!map[r.date]) map[r.date] = { date: r.date, revenue: 0, orders: 0, discount: 0 };
+      map[r.date].revenue -= r.amount;
+    });
     return Object.values(map)
       .sort((a, b) => a.date.localeCompare(b.date))
       .map(d => ({
@@ -2182,28 +2338,28 @@ function SalesRecords({ orders }: { orders: Order[] }) {
         revenue: Math.round(d.revenue),
         discount: Math.round(d.discount),
       }));
-  }, [filteredOrders]);
+  }, [filteredOrders, filteredRefunds]);
 
   // Category breakdown for pie chart
   const categoryData = useMemo(() => {
     const map: Record<string, number> = {};
-    filteredOrders.forEach(o => o.items.forEach(i => {
+    salesOrders.forEach(o => o.items.forEach(i => {
       map[i.category] = (map[i.category] ?? 0) + i.price * i.qty;
     }));
     return Object.entries(map).map(([name, value]) => ({ name, value: Math.round(value) }))
       .sort((a, b) => b.value - a.value);
-  }, [filteredOrders]);
+  }, [salesOrders]);
 
   // Payment mode breakdown
   const paymentData = useMemo(() => {
     const map: Record<string, { count: number; revenue: number }> = {};
-    filteredOrders.forEach(o => {
+    salesOrders.forEach(o => {
       if (!map[o.paymentMode]) map[o.paymentMode] = { count: 0, revenue: 0 };
       map[o.paymentMode].count += 1;
       map[o.paymentMode].revenue += o.total;
     });
     return Object.entries(map).map(([name, v]) => ({ name, ...v, revenue: Math.round(v.revenue) }));
-  }, [filteredOrders]);
+  }, [salesOrders]);
 
   const toggleSort = (key: SortKey) => {
     if (sortKey === key) setSortDir(d => d === "desc" ? "asc" : "desc");
@@ -2254,10 +2410,10 @@ function SalesRecords({ orders }: { orders: Order[] }) {
       {/* KPI row */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         {[
-          { label: "Total Revenue", value: fmt(totalRevenue), sub: `${filteredOrders.length} orders`, icon: IndianRupee, positive: true },
+          { label: "Net Revenue", value: fmt(netRevenue), sub: refundTotal > 0 ? `${fmt(refundTotal)} refunded · ${salesOrders.length} orders` : `${salesOrders.length} orders`, icon: IndianRupee, positive: true },
           { label: "Avg Order Value", value: fmt(avgOrderValue), sub: "per transaction", icon: TrendingUp, positive: true },
           { label: "Items Sold", value: totalItemsSold.toLocaleString("en-IN"), sub: "units across all orders", icon: ShoppingBag, positive: true },
-          { label: "Total Discounts", value: fmt(totalDiscount), sub: `${totalRevenue > 0 ? ((totalDiscount / (totalRevenue + totalDiscount)) * 100).toFixed(1) : 0}% of gross`, icon: Tag, positive: false },
+          { label: "Total Discounts", value: fmt(totalDiscount), sub: `${netRevenue > 0 ? ((totalDiscount / (netRevenue + totalDiscount)) * 100).toFixed(1) : 0}% of net`, icon: Tag, positive: false },
         ].map(({ label, value, sub, icon: Icon, positive }) => (
           <div key={label} className="bg-card rounded-xl border border-border p-4">
             <div className="flex items-start justify-between">
@@ -2587,6 +2743,62 @@ const DEFAULT_SHOP: ShopInfo = {
 
 type SettingsTab = "business" | "contact" | "address" | "banking" | "operations";
 
+type ShopFieldChange = (k: keyof ShopInfo) => (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => void;
+
+function SettingsField({
+  label, fieldKey, draft, onFieldChange, placeholder, type = "text", icon: Icon, hint,
+}: {
+  label: string;
+  fieldKey: keyof ShopInfo;
+  draft: ShopInfo;
+  onFieldChange: ShopFieldChange;
+  placeholder?: string;
+  type?: string;
+  icon?: typeof MapPin;
+  hint?: string;
+}) {
+  return (
+    <div>
+      <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wide block mb-1.5">{label}</label>
+      <div className="relative">
+        {Icon && <Icon size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />}
+        <input
+          type={type}
+          value={draft[fieldKey] ?? ""}
+          onChange={onFieldChange(fieldKey)}
+          placeholder={placeholder}
+          className={`w-full py-2.5 rounded-lg bg-input-background border border-border text-sm focus:outline-none focus:ring-2 focus:ring-ring transition-colors ${Icon ? "pl-9 pr-4" : "px-3"}`}
+        />
+      </div>
+      {hint && <p className="text-xs text-muted-foreground mt-1 opacity-70">{hint}</p>}
+    </div>
+  );
+}
+
+function SettingsTextArea({
+  label, fieldKey, draft, onFieldChange, placeholder, rows = 3,
+}: {
+  label: string;
+  fieldKey: keyof ShopInfo;
+  draft: ShopInfo;
+  onFieldChange: ShopFieldChange;
+  placeholder?: string;
+  rows?: number;
+}) {
+  return (
+    <div>
+      <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wide block mb-1.5">{label}</label>
+      <textarea
+        rows={rows}
+        value={draft[fieldKey] ?? ""}
+        onChange={onFieldChange(fieldKey)}
+        placeholder={placeholder}
+        className="w-full px-3 py-2.5 rounded-lg bg-input-background border border-border text-sm focus:outline-none focus:ring-2 focus:ring-ring transition-colors resize-none"
+      />
+    </div>
+  );
+}
+
 function ShopSettings({ activeShop, onSave }: { activeShop: RegisteredShop | null; onSave: (updates: Partial<RegisteredShop>) => Promise<boolean>; }) {
   const [shop, setShop] = useState<ShopInfo>(DEFAULT_SHOP);
   const [draft, setDraft] = useState<ShopInfo>(DEFAULT_SHOP);
@@ -2669,41 +2881,6 @@ function ShopSettings({ activeShop, onSave }: { activeShop: RegisteredShop | nul
     setHasChanges(false);
     setSaved(false);
   };
-
-  const Field = ({
-    label, fieldKey, placeholder, type = "text", icon: Icon, hint,
-  }: {
-    label: string; fieldKey: keyof ShopInfo; placeholder?: string;
-    type?: string; icon?: typeof MapPin; hint?: string;
-  }) => (
-    <div>
-      <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wide block mb-1.5">{label}</label>
-      <div className="relative">
-        {Icon && <Icon size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />}
-        <input
-          type={type}
-          value={draft[fieldKey] ?? ""}
-          onChange={set(fieldKey)}
-          placeholder={placeholder}
-          className={`w-full py-2.5 rounded-lg bg-input-background border border-border text-sm focus:outline-none focus:ring-2 focus:ring-ring transition-colors ${Icon ? "pl-9 pr-4" : "px-3"}`}
-        />
-      </div>
-      {hint && <p className="text-xs text-muted-foreground mt-1 opacity-70">{hint}</p>}
-    </div>
-  );
-
-  const TextArea = ({ label, fieldKey, placeholder, rows = 3 }: { label: string; fieldKey: keyof ShopInfo; placeholder?: string; rows?: number }) => (
-    <div>
-      <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wide block mb-1.5">{label}</label>
-      <textarea
-        rows={rows}
-        value={draft[fieldKey] ?? ""}
-        onChange={set(fieldKey)}
-        placeholder={placeholder}
-        className="w-full px-3 py-2.5 rounded-lg bg-input-background border border-border text-sm focus:outline-none focus:ring-2 focus:ring-ring transition-colors resize-none"
-      />
-    </div>
-  );
 
   const tabs: { id: SettingsTab; label: string; icon: typeof Building2 }[] = [
     { id: "business", label: "Business Info", icon: Building2 },
@@ -2791,14 +2968,14 @@ function ShopSettings({ activeShop, onSave }: { activeShop: RegisteredShop | nul
             <SectionHead icon={Building2} title="Business Information" desc="Your shop's primary identity details" />
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="md:col-span-2">
-                <Field label="Shop / Business Name" fieldKey="shopName" placeholder="Banke Bihari Sweets & Restaurants" icon={Building2} />
+                <SettingsField label="Shop / Business Name" fieldKey="shopName" draft={draft} onFieldChange={set} placeholder="Banke Bihari Sweets & Restaurants" icon={Building2} />
               </div>
               <div className="md:col-span-2">
-                <Field label="Tagline / Motto" fieldKey="tagline" placeholder="Your shop's catchphrase" />
+                <SettingsField label="Tagline / Motto" fieldKey="tagline" draft={draft} onFieldChange={set} placeholder="Your shop's catchphrase" />
               </div>
-              <Field label="Owner / Proprietor Name" fieldKey="ownerName" placeholder="Full name" icon={Users} />
-              <Field label="Currency" fieldKey="currency" placeholder="INR" />
-              <Field label="Default Tax Rate (%)" fieldKey="taxRate" placeholder="5" type="number" hint="Applied on invoices when tax is applicable" />
+              <SettingsField label="Owner / Proprietor Name" fieldKey="ownerName" draft={draft} onFieldChange={set} placeholder="Full name" icon={Users} />
+              <SettingsField label="Currency" fieldKey="currency" draft={draft} onFieldChange={set} placeholder="INR" />
+              <SettingsField label="Default Tax Rate (%)" fieldKey="taxRate" draft={draft} onFieldChange={set} placeholder="5" type="number" hint="Applied on invoices when tax is applicable" />
             </div>
           </div>
         )}
@@ -2808,10 +2985,10 @@ function ShopSettings({ activeShop, onSave }: { activeShop: RegisteredShop | nul
           <div className="p-6 space-y-5">
             <SectionHead icon={Phone} title="Contact Details" desc="How customers and suppliers can reach you" />
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <Field label="Primary Phone" fieldKey="phone" placeholder="+91 99999 12345" icon={Phone} type="tel" />
-              <Field label="Alternate Phone" fieldKey="altPhone" placeholder="+91 98888 00000" icon={Phone} type="tel" />
-              <Field label="Email Address" fieldKey="email" placeholder="shop@example.com" icon={Mail} type="email" />
-              <Field label="Website" fieldKey="website" placeholder="www.yourshop.in" icon={Globe} />
+              <SettingsField label="Primary Phone" fieldKey="phone" draft={draft} onFieldChange={set} placeholder="+91 99999 12345" icon={Phone} type="tel" />
+              <SettingsField label="Alternate Phone" fieldKey="altPhone" draft={draft} onFieldChange={set} placeholder="+91 98888 00000" icon={Phone} type="tel" />
+              <SettingsField label="Email Address" fieldKey="email" draft={draft} onFieldChange={set} placeholder="shop@example.com" icon={Mail} type="email" />
+              <SettingsField label="Website" fieldKey="website" draft={draft} onFieldChange={set} placeholder="www.yourshop.in" icon={Globe} />
             </div>
           </div>
         )}
@@ -2822,12 +2999,12 @@ function ShopSettings({ activeShop, onSave }: { activeShop: RegisteredShop | nul
             <SectionHead icon={MapPin} title="Shop Address" desc="Used on invoices and for customer navigation" />
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="md:col-span-2">
-                <TextArea label="Street Address" fieldKey="address" placeholder="Shop No., Street, Colony" rows={2} />
+                <SettingsTextArea label="Street Address" fieldKey="address" draft={draft} onFieldChange={set} placeholder="Shop No., Street, Colony" rows={2} />
               </div>
-              <Field label="Landmark" fieldKey="landmark" placeholder="Near famous temple, market etc." icon={MapPin} />
-              <Field label="City" fieldKey="city" placeholder="Vrindavan" />
-              <Field label="State" fieldKey="state" placeholder="Uttar Pradesh" />
-              <Field label="PIN Code" fieldKey="pincode" placeholder="281121" type="text" />
+              <SettingsField label="Landmark" fieldKey="landmark" draft={draft} onFieldChange={set} placeholder="Near famous temple, market etc." icon={MapPin} />
+              <SettingsField label="City" fieldKey="city" draft={draft} onFieldChange={set} placeholder="Vrindavan" />
+              <SettingsField label="State" fieldKey="state" draft={draft} onFieldChange={set} placeholder="Uttar Pradesh" />
+              <SettingsField label="PIN Code" fieldKey="pincode" draft={draft} onFieldChange={set} placeholder="281121" type="text" />
             </div>
             {/* Map preview placeholder */}
             <div className="rounded-xl border border-border overflow-hidden bg-muted/40 h-32 flex items-center justify-center text-muted-foreground text-sm gap-2">
@@ -2845,19 +3022,19 @@ function ShopSettings({ activeShop, onSave }: { activeShop: RegisteredShop | nul
             <div>
               <p className="text-xs font-bold text-muted-foreground uppercase tracking-wider mb-3">Tax Registration</p>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <Field label="GSTIN" fieldKey="gstin" placeholder="09AABCU9603R1ZM" icon={Hash} hint="15-digit GST Identification Number" />
-                <Field label="PAN Number" fieldKey="pan" placeholder="AABCU9603R" icon={Hash} />
-                <Field label="FSSAI License No." fieldKey="fssaiNo" placeholder="12520999000123" icon={Hash} hint="Required for food businesses" />
+                <SettingsField label="GSTIN" fieldKey="gstin" draft={draft} onFieldChange={set} placeholder="09AABCU9603R1ZM" icon={Hash} hint="15-digit GST Identification Number" />
+                <SettingsField label="PAN Number" fieldKey="pan" draft={draft} onFieldChange={set} placeholder="AABCU9603R" icon={Hash} />
+                <SettingsField label="FSSAI License No." fieldKey="fssaiNo" draft={draft} onFieldChange={set} placeholder="12520999000123" icon={Hash} hint="Required for food businesses" />
               </div>
             </div>
 
             <div className="border-t border-border pt-5">
               <p className="text-xs font-bold text-muted-foreground uppercase tracking-wider mb-3">Bank Account</p>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <Field label="Bank Name" fieldKey="bankName" placeholder="State Bank of India" icon={Building2} />
-                <Field label="Account Number" fieldKey="accountNo" placeholder="31245678901" icon={CreditCard} type="text" />
-                <Field label="IFSC Code" fieldKey="ifsc" placeholder="SBIN0001234" icon={Hash} />
-                <Field label="UPI ID" fieldKey="upiId" placeholder="shopname@bank" icon={Hash} />
+                <SettingsField label="Bank Name" fieldKey="bankName" draft={draft} onFieldChange={set} placeholder="State Bank of India" icon={Building2} />
+                <SettingsField label="Account Number" fieldKey="accountNo" draft={draft} onFieldChange={set} placeholder="31245678901" icon={CreditCard} type="text" />
+                <SettingsField label="IFSC Code" fieldKey="ifsc" draft={draft} onFieldChange={set} placeholder="SBIN0001234" icon={Hash} />
+                <SettingsField label="UPI ID" fieldKey="upiId" draft={draft} onFieldChange={set} placeholder="shopname@bank" icon={Hash} />
               </div>
             </div>
           </div>
@@ -2891,7 +3068,7 @@ function ShopSettings({ activeShop, onSave }: { activeShop: RegisteredShop | nul
                 </p>
               </div>
             </div>
-            <TextArea label="Holidays / Closed Days" fieldKey="holidays" placeholder="List holidays or special closures" rows={3} />
+            <SettingsTextArea label="Holidays / Closed Days" fieldKey="holidays" draft={draft} onFieldChange={set} placeholder="List holidays or special closures" rows={3} />
           </div>
         )}
       </div>
@@ -3166,18 +3343,19 @@ function RefundModal({
 }: {
   order: Order;
   onClose: () => void;
-  onRefund: (refund: Refund) => void;
+  onRefund: (refund: Refund) => Promise<boolean>;
 }) {
   const [type, setType] = useState<"full" | "partial">("full");
   const [amount, setAmount] = useState(order.total.toFixed(2));
   const [reason, setReason] = useState("");
   const [refundMode, setRefundMode] = useState<"Cash" | "UPI" | "Card">(order.paymentMode);
   const [error, setError] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   const maxAmount = order.total;
   const refundAmt = parseFloat(amount) || 0;
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
     if (!reason.trim()) { setError("Please enter a reason for refund."); return; }
     if (refundAmt <= 0 || refundAmt > maxAmount) { setError(`Amount must be between ₹0.01 and ${fmt(maxAmount)}.`); return; }
     const refund: Refund = {
@@ -3191,7 +3369,18 @@ function RefundModal({
       amount: refundAmt,
       type,
     };
-    onRefund(refund);
+    setIsSubmitting(true);
+    setError("");
+    try {
+      const success = await onRefund(refund);
+      if (!success) {
+        setError("Unable to process refund. Please try again.");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to process refund. Please try again.");
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   return (
@@ -3287,10 +3476,10 @@ function RefundModal({
         </div>
 
         <div className="px-6 pb-6 flex gap-3">
-          <button onClick={onClose} className="flex-1 py-2.5 rounded-xl border border-border text-sm font-medium hover:bg-muted transition-colors">Cancel</button>
-          <button onClick={handleSubmit}
-            className="flex-1 py-2.5 rounded-xl bg-destructive text-destructive-foreground text-sm font-semibold hover:opacity-90 transition-opacity flex items-center justify-center gap-2">
-            <RotateCcw size={13} /> Refund {fmt(refundAmt)}
+          <button onClick={onClose} disabled={isSubmitting} className="flex-1 py-2.5 rounded-xl border border-border text-sm font-medium hover:bg-muted transition-colors disabled:opacity-50">Cancel</button>
+          <button onClick={handleSubmit} disabled={isSubmitting}
+            className="flex-1 py-2.5 rounded-xl bg-destructive text-destructive-foreground text-sm font-semibold hover:opacity-90 transition-opacity flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed">
+            <RotateCcw size={13} /> {isSubmitting ? "Processing…" : `Refund ${fmt(refundAmt)}`}
           </button>
         </div>
       </div>
@@ -3749,10 +3938,11 @@ function LoginPage({
 
 // ── RetailX Admin Panel ────────────────────────────────────────────────────
 
-function AdminPanel({ onLogout, shops, onAddShop, onUpdateShopStatus }: {
+function AdminPanel({ onLogout, shops, shopsLoadError, onAddShop, onUpdateShopStatus }: {
   onLogout: () => void;
   shops: RegisteredShop[];
-  onAddShop: (s: RegisteredShop) => Promise<void>;
+  shopsLoadError?: string | null;
+  onAddShop: (s: RegisteredShop) => Promise<RegisteredShop>;
   onUpdateShopStatus: (id: string, status: ShopStatus) => void;
 }) {
   const [tab, setTab] = useState<"shops" | "register">("shops");
@@ -3796,10 +3986,14 @@ function AdminPanel({ onLogout, shops, onAddShop, onUpdateShopStatus }: {
       plan: form.plan,
       registeredOn: todayISO,
     };
-    await onAddShop(shop);
-    setGenCreds({ username, password });
-    setFormErr("");
-    setForm(emptyForm);
+    try {
+      const saved = await onAddShop(shop);
+      setGenCreds({ username: saved.username ?? username, password: saved.password ?? password });
+      setFormErr("");
+      setForm(emptyForm);
+    } catch (err) {
+      setFormErr(err instanceof Error ? err.message : "Failed to create shop");
+    }
   };
 
   const copy = (text: string, key: string) => {
@@ -3875,6 +4069,12 @@ function AdminPanel({ onLogout, shops, onAddShop, onUpdateShopStatus }: {
         {/* ── Shops list ── */}
         {tab === "shops" && (
           <div className="space-y-4">
+            {shopsLoadError && (
+              <div className="rounded-xl px-4 py-3 text-sm font-semibold border"
+                style={{ backgroundColor: "rgba(248,113,113,0.1)", borderColor: "rgba(248,113,113,0.35)", color: "#FCA5A5" }}>
+                Failed to load shops: {shopsLoadError}
+              </div>
+            )}
             <div className="flex flex-wrap gap-3">
               <div className="relative flex-1 min-w-52">
                 <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "rgba(255,255,255,0.3)" }} />
@@ -3905,7 +4105,7 @@ function AdminPanel({ onLogout, shops, onAddShop, onUpdateShopStatus }: {
                 </thead>
                 <tbody>
                   {filtered.map(s => {
-                    const pm = PLAN_META[s.plan];
+                    const pm = PLAN_META[s.plan] ?? PLAN_META.standard;
                     const showCreds = viewCreds === s.id;
                     return (
                       <React.Fragment key={s.id}>
@@ -4115,6 +4315,7 @@ export default function App() {
   const [authUser, setAuthUser]     = useState<AuthUser | null>(null);
   const [activeShop, setActiveShop] = useState<RegisteredShop | null>(null);
   const [shops, setShops]           = useState<RegisteredShop[]>([]);
+  const [shopsLoadError, setShopsLoadError] = useState<string | null>(null);
   const [shopsLoading, setShopsLoading] = useState(true);
   const [view, setView]             = useState<View>("pos");
   const [showDrawer, setShowDrawer] = useState(false);
@@ -4151,21 +4352,42 @@ export default function App() {
         });
 
         if (user.role === 'admin') {
-          const loadedShops = await fetchShops();
-          setShops(loadedShops);
-          if (loadedShops.length > 0) {
-            setActiveShop(loadedShops[0]);
+          try {
+            const loadedShops = await fetchShops();
+            setShops(loadedShops);
+            setShopsLoadError(null);
+            if (loadedShops.length > 0) {
+              setActiveShop(loadedShops[0]);
+            }
+          } catch (err) {
+            setShops([]);
+            setShopsLoadError(
+              err instanceof ShopFetchError ? err.message : 'Failed to load shops'
+            );
           }
         } else if (user.shop_id) {
           const shop = await fetchShopById(user.shop_id);
           if (shop) {
             setActiveShop(shop);
           } else {
-            const fallbackShop = SEED_SHOPS.find(s => s.id === user.shop_id);
-            if (fallbackShop) {
-              console.warn(`Falling back to local seeded shop for id=${user.shop_id}`);
-              setActiveShop(fallbackShop);
-            }
+            console.warn(`Shop row not found for id=${user.shop_id}; using placeholder shop data.`);
+            setActiveShop({
+              id: user.shop_id,
+              shopName: 'My Shop',
+              ownerName: user.email || 'Shop Owner',
+              phone: '',
+              email: user.email || '',
+              address: '',
+              city: '',
+              state: '',
+              category: '',
+              gstin: '',
+              username: '',
+              password: '',
+              status: 'active',
+              plan: 'standard',
+              registeredOn: '',
+            });
           }
         }
       } catch (err) {
@@ -4178,8 +4400,10 @@ export default function App() {
     initializeAuth();
   }, []);
 
-  // Use the custom hook for shop data management
-  const shopDataHook = useShopData(activeShop?.id ?? null);
+  // Use the authenticated user's shopId first, because activeShop may be a local fallback
+  // when the backend shop row is not loadable due to RLS or missing permissions.
+  const shopId = authUser?.shopId ?? activeShop?.id ?? null;
+  const shopDataHook = useShopData(shopId);
   const { 
     products, 
     orders, 
@@ -4198,7 +4422,7 @@ export default function App() {
     addOrder,
     updateOrder,
     addRefund,
-    addWastage,
+    recordWastage,
     openDrawer,
     closeDrawer,
     addDrawerTx,
@@ -4207,7 +4431,7 @@ export default function App() {
   // ── Drawer helpers ───────────────────────────────────────────────────────
 
   const drawerBalance = useMemo(() => {
-    if (!drawerDay || drawerDay.closing_balance !== null) return null;
+    if (!drawerDay || drawerDay.closingBalance !== null) return null;
     return drawerDay.transactions.reduce((s, t) => s + t.amount, 0);
   }, [drawerDay]);
 
@@ -4254,24 +4478,27 @@ export default function App() {
     return savedOrder;
   }, [addOrder, addDrawerTx]);
 
-  const handleRefund = useCallback((refund: Refund, order: Order) => {
+  const handleRefund = useCallback(async (refund: Refund, order: Order): Promise<boolean> => {
+    const success = await addRefund(refund, order.items);
+    if (!success) return false;
+
     const todayISO = new Date().toISOString().split('T')[0];
-    const nowTime = () => new Date().toLocaleTimeString('en-GB', { hour12: false });
-    
-    // Call addRefund with items for inventory restoration
-    addRefund(refund, order.items);
-    
-    // Record drawer transaction for refund
-    const txAmount = -refund.amount; // negative for refund
-    const description = `Refund ${refund.id} for ${refund.order_id} — ${refund.customer_name} (${refund.refund_mode})`;
-    
-    addDrawerTx({ 
-      date: todayISO, 
-      time: nowTime(), 
-      type: 'refund', 
-      description, 
-      amount: txAmount 
+    const nowTimeStr = new Date().toLocaleTimeString('en-GB', { hour12: false });
+    const description = `Refund ${refund.id} for ${refund.orderId} — ${refund.customerName} (${refund.refundMode})`;
+
+    const drawerSuccess = await addDrawerTx({
+      date: todayISO,
+      time: nowTimeStr,
+      type: 'refund',
+      description,
+      amount: -refund.amount,
     });
+
+    if (!drawerSuccess) {
+      console.warn('Refund saved but drawer transaction failed');
+    }
+
+    return true;
   }, [addRefund, addDrawerTx]);
 
   const navItems: { id: View; label: string; icon: typeof LayoutDashboard }[] = [
@@ -4340,11 +4567,39 @@ export default function App() {
           if (mapped.shopId) {
             const shop = await fetchShopById(mapped.shopId);
             if (shop) setActiveShop(shop);
+            else {
+              console.warn(`Logged in user shop row not found for shopId=${mapped.shopId}; using placeholder shop data.`);
+              setActiveShop({
+                id: mapped.shopId,
+                shopName: 'My Shop',
+                ownerName: mapped.name || 'Shop Owner',
+                phone: '',
+                email: mapped.email || '',
+                address: '',
+                city: '',
+                state: '',
+                category: '',
+                gstin: '',
+                username: '',
+                password: '',
+                status: 'active',
+                plan: 'standard',
+                registeredOn: '',
+              });
+            }
           }
 
           if (mapped.role === 'admin') {
-            const loadedShops = await fetchShops();
-            setShops(loadedShops);
+            try {
+              const loadedShops = await fetchShops();
+              setShops(loadedShops);
+              setShopsLoadError(null);
+            } catch (err) {
+              setShops([]);
+              setShopsLoadError(
+                err instanceof ShopFetchError ? err.message : 'Failed to load shops'
+              );
+            }
           }
         }}
       />
@@ -4361,18 +4616,14 @@ export default function App() {
       <AdminPanel
         onLogout={handleLogout}
         shops={shops}
+        shopsLoadError={shopsLoadError}
         onAddShop={async s => {
-          try {
-            const savedShop = await addShop(s);
-            if (savedShop) {
-              setShops(prev => [...prev, savedShop]);
-            } else {
-              setShops(prev => [...prev, s]);
-            }
-          } catch (err) {
-            console.error('Error adding shop:', err);
-            setShops(prev => [...prev, s]);
+          const savedShop = await addShop(s);
+          if (!savedShop) {
+            throw new Error('Shop provisioning failed');
           }
+          setShops(prev => [...prev, savedShop]);
+          return savedShop;
         }}
         onUpdateShopStatus={(id, status) => setShops(prev => prev.map(s => s.id === id ? { ...s, status } : s))}
       />
@@ -4398,7 +4649,7 @@ export default function App() {
                   {activeShop ? activeShop.shopName.split(" ").slice(0, 3).join(" ") : "RetailX POS"}
                 </div>
                 <div className="text-xs opacity-50 leading-tight truncate">
-                  {activeShop ? `${activeShop.city} · ${PLAN_META[activeShop.plan].label}` : "Dashboard"}
+                  {activeShop ? `${activeShop.city} · ${(PLAN_META[activeShop.plan] ?? PLAN_META.standard).label}` : "Dashboard"}
                 </div>
               </div>
             )}
@@ -4519,10 +4770,10 @@ export default function App() {
         <div className={`px-6 py-6 ${view === "pos" ? "h-[calc(100vh-57px)] flex flex-col" : ""}`}>
           {view === "dashboard" && <Dashboard orders={orders} products={products} batchMap={batchMap} />}
           {view === "pos" && <div className="flex-1 min-h-0"><POS products={products} onOrderComplete={handleOrderComplete} batchMap={batchMap} shop={activeShop} /></div>}
-          {view === "inventory" && <Inventory products={products} onAdd={addProduct} onUpdate={updateProduct} onDelete={deleteProduct} batchMap={batchMap} onAddBatch={addBatch} onDeleteBatch={deleteBatch} onUpdateBatch={updateBatch} onWaste={addWastage} />}
+          {view === "inventory" && <Inventory products={products} onAdd={addProduct} onUpdate={updateProduct} onDelete={deleteProduct} batchMap={batchMap} onAddBatch={addBatch} onDeleteBatch={deleteBatch} onUpdateBatch={updateBatch} onWaste={recordWastage} />}
           {view === "wastage" && <WastageLog entries={wastageLog} />}
           {view === "orders" && <Orders orders={orders} refunds={refunds} onRefund={handleRefund} shop={activeShop} />}
-          {view === "sales" && <SalesRecords orders={orders} />}
+          {view === "sales" && <SalesRecords orders={orders} refunds={refunds} />}
           {view === "settings" && <ShopSettings activeShop={activeShop} onSave={handleSaveShop} />}
         </div>
       </main>

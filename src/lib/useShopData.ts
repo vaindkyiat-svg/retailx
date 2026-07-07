@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback } from 'react';
+import { getAuthUser } from './auth';
 import {
   fetchProducts,
   fetchBatches,
@@ -41,6 +42,12 @@ interface ShopDataState {
   batchMap: Record<number, Batch[]>;
   isLoading: boolean;
   error: string | null;
+}
+
+async function resolveShopId(shopId: string | null): Promise<string | null> {
+  if (shopId) return shopId;
+  const user = await getAuthUser();
+  return user?.shop_id ?? null;
 }
 
 export function useShopData(shopId: string | null) {
@@ -110,19 +117,17 @@ export function useShopData(shopId: string | null) {
   }, [shopId]);
 
   // Product operations
-  const addProduct = useCallback(async (data: Omit<Product, 'id' | 'shop_id'>) => {
-    if (!shopId) return;
-    try {
-      const newProduct = await dbAddProduct(shopId, data);
-      if (newProduct) {
-        setState(prev => ({
-          ...prev,
-          products: [...prev.products, newProduct],
-        }));
-      }
-    } catch (err) {
-      console.error('Error adding product:', err);
+  const addProduct = useCallback(async (data: Omit<Product, 'id' | 'shop_id'>): Promise<boolean> => {
+    const effectiveShopId = await resolveShopId(shopId);
+    if (!effectiveShopId) {
+      throw new Error('Shop ID is missing. Please sign out, sign in again, and retry.');
     }
+    const newProduct = await dbAddProduct(effectiveShopId, data);
+    setState(prev => ({
+      ...prev,
+      products: [...prev.products, newProduct],
+    }));
+    return true;
   }, [shopId]);
 
   const updateProduct = useCallback(async (id: number, data: Omit<Product, 'id' | 'shop_id'>) => {
@@ -160,8 +165,11 @@ export function useShopData(shopId: string | null) {
   }, [shopId]);
 
   // Batch operations
-  const addBatch = useCallback(async (productId: number, batch: Omit<Batch, 'id' | 'shop_id' | 'product_id'>) => {
-    if (!shopId) return;
+  const addBatch = useCallback(async (productId: number, batch: Omit<Batch, 'id' | 'shop_id' | 'product_id'>): Promise<boolean> => {
+    if (!shopId) {
+      console.error('Cannot add batch without shopId');
+      return false;
+    }
     try {
       const newBatch = await dbAddBatch(shopId, productId, batch);
       if (newBatch) {
@@ -173,9 +181,12 @@ export function useShopData(shopId: string | null) {
             [productId]: [...(prev.batchMap[productId] || []), newBatch],
           },
         }));
+        return true;
       }
+      return false;
     } catch (err) {
       console.error('Error adding batch:', err);
+      return false;
     }
   }, [shopId]);
 
@@ -274,38 +285,92 @@ export function useShopData(shopId: string | null) {
   }, [shopId]);
 
   // Refund operations
-  const addRefund = useCallback(async (refund: Omit<Refund, 'shop_id'>, items?: CartItem[]) => {
-    if (!shopId) return;
+  const addRefund = useCallback(async (refund: Omit<Refund, 'shop_id'>, items?: CartItem[]): Promise<boolean> => {
+    const effectiveShopId = await resolveShopId(shopId);
+    if (!effectiveShopId) {
+      console.error('Cannot add refund without shopId');
+      return false;
+    }
     try {
-      // Use inventory-aware refund creation if items provided
-      const newRefund = items && items.length > 0 
-        ? await createRefundWithInventory(shopId, refund, items)
-        : await dbAddRefund(shopId, refund);
-      
-      if (newRefund) {
-        setState(prev => ({
-          ...prev,
+      const refundWithItems = items?.length ? { ...refund, items } : refund;
+      const newRefund = items && items.length > 0
+        ? await createRefundWithInventory(effectiveShopId, refundWithItems, items)
+        : await dbAddRefund(effectiveShopId, refundWithItems as Omit<Refund, 'shop_id'>);
+
+      if (!newRefund) return false;
+
+      const batches = items?.length ? await fetchBatches(effectiveShopId) : null;
+      setState(prev => {
+        const next: Partial<ShopDataState> = {
           refunds: [newRefund, ...prev.refunds],
-        }));
-      }
+        };
+        if (batches) {
+          const batchMap: Record<number, Batch[]> = {};
+          batches.forEach(batch => {
+            if (!batchMap[batch.product_id]) batchMap[batch.product_id] = [];
+            batchMap[batch.product_id].push(batch);
+          });
+          next.batches = batches;
+          next.batchMap = batchMap;
+        }
+        return { ...prev, ...next };
+      });
+      return true;
     } catch (err) {
       console.error('Error adding refund:', err);
+      return false;
     }
   }, [shopId]);
 
-  // Wastage operations
-  const addWastage = useCallback(async (entry: Omit<WastageEntry, 'shop_id'>) => {
-    if (!shopId) return;
+  // Wastage: insert log entry first, then adjust batch quantity
+  const recordWastage = useCallback(async (
+    productId: number,
+    batch: Batch,
+    entry: Omit<WastageEntry, 'id' | 'shop_id'>,
+  ): Promise<boolean> => {
+    if (!shopId) return false;
     try {
       const newEntry = await dbAddWastage(shopId, entry);
-      if (newEntry) {
+      if (!newEntry) return false;
+
+      setState(prev => ({
+        ...prev,
+        wastageLog: [newEntry, ...prev.wastageLog],
+      }));
+
+      const remaining = batch.quantity - entry.quantity;
+      if (remaining <= 0) {
+        const ok = await dbDeleteBatch(batch.id, shopId);
+        if (ok) {
+          setState(prev => ({
+            ...prev,
+            batches: prev.batches.filter(b => b.id !== batch.id),
+            batchMap: {
+              ...prev.batchMap,
+              [productId]: (prev.batchMap[productId] ?? []).filter(b => b.id !== batch.id),
+            },
+          }));
+        }
+        return ok;
+      }
+
+      const ok = await dbUpdateBatch(batch.id, shopId, { quantity: remaining });
+      if (ok) {
         setState(prev => ({
           ...prev,
-          wastageLog: [newEntry, ...prev.wastageLog],
+          batches: prev.batches.map(b => b.id === batch.id ? { ...b, quantity: remaining } : b),
+          batchMap: {
+            ...prev.batchMap,
+            [productId]: (prev.batchMap[productId] ?? []).map(b =>
+              b.id === batch.id ? { ...b, quantity: remaining } : b
+            ),
+          },
         }));
       }
+      return ok;
     } catch (err) {
-      console.error('Error adding wastage:', err);
+      console.error('Error recording wastage:', err);
+      return false;
     }
   }, [shopId]);
 
@@ -318,13 +383,11 @@ export function useShopData(shopId: string | null) {
       
       const drawerDay = await dbCreateDrawerDay(shopId, {
         date: todayISO,
-        opening_balance: opening,
-        closing_balance: null,
-        transactions: [],
+        openingBalance: opening,
+        closingBalance: null,
       });
 
       if (drawerDay) {
-        // Add opening transaction
         const initTx = {
           date: todayISO,
           time: nowTime(),
@@ -334,13 +397,13 @@ export function useShopData(shopId: string | null) {
           balance: opening,
         };
 
-        await addDrawerTransaction(shopId, drawerDay.id, initTx);
+        const createdTx = await addDrawerTransaction(shopId, drawerDay.id, initTx);
 
         setState(prev => ({
           ...prev,
           drawerDay: {
             ...drawerDay,
-            transactions: [{ ...initTx, id: `DTX-${Date.now()}` }],
+            transactions: createdTx ? [createdTx] : [],
           },
         }));
       }
@@ -352,8 +415,9 @@ export function useShopData(shopId: string | null) {
   const closeDrawer = useCallback(async () => {
     if (!shopId || !state.drawerDay) return;
     try {
+      const closingBalance = state.drawerDay.transactions.reduce((s, t) => s + t.amount, 0);
       const success = await dbUpdateDrawerDay(state.drawerDay.id, shopId, {
-        closing_balance: state.drawerDay.transactions.reduce((s, t) => s + t.amount, 0),
+        closingBalance,
       });
 
       if (success) {
@@ -361,7 +425,7 @@ export function useShopData(shopId: string | null) {
           ...prev,
           drawerDay: {
             ...prev.drawerDay,
-            closing_balance: prev.drawerDay.transactions.reduce((s, t) => s + t.amount, 0),
+            closingBalance,
           },
         } : prev);
       }
@@ -370,16 +434,15 @@ export function useShopData(shopId: string | null) {
     }
   }, [shopId, state.drawerDay]);
 
-  const addDrawerTx = useCallback(async (tx: Omit<DrawerTx, 'id'>) => {
+  const addDrawerTx = useCallback(async (tx: { date: string; time: string; type: DrawerTx['type']; description: string; amount: number }) => {
     if (!shopId) return false;
     try {
       let drawerDay = state.drawerDay;
       if (!drawerDay) {
         drawerDay = await dbCreateDrawerDay(shopId, {
           date: tx.date,
-          opening_balance: 0,
-          closing_balance: null,
-          transactions: [],
+          openingBalance: 0,
+          closingBalance: null,
         });
 
         if (!drawerDay) {
@@ -400,7 +463,7 @@ export function useShopData(shopId: string | null) {
       const newTx = {
         ...tx,
         balance: runningBal,
-      };
+      } as Omit<DrawerTx, 'id'>;
 
       const createdTx = await addDrawerTransaction(shopId, drawerDay.id, newTx);
       if (!createdTx) {
@@ -437,7 +500,7 @@ export function useShopData(shopId: string | null) {
     addOrder,
     updateOrder,
     addRefund,
-    addWastage,
+    recordWastage,
     openDrawer,
     closeDrawer,
     addDrawerTx,

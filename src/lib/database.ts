@@ -86,16 +86,16 @@ export interface WastageEntry {
   shop_id: string;
   date: string;
   time: string;
-  product_id: number;
-  product_name: string;
-  product_emoji: string;
+  productId: number;
+  productName: string;
+  productEmoji: string;
   category: string;
-  batch_no: string;
-  batch_id: string;
-  expiry_date: string;
+  batchNo: string;
+  batchId: string;
+  expiryDate: string;
   quantity: number;
-  cost_price: number;
-  total_loss: number;
+  costPrice: number;
+  totalLoss: number;
   reason: WastageReason;
   notes: string;
   created_at?: string;
@@ -118,8 +118,8 @@ export interface DrawerDay {
   id: string;
   shop_id: string;
   date: string;
-  opening_balance: number;
-  closing_balance: number | null;
+  openingBalance: number;
+  closingBalance: number | null;
   transactions: DrawerTx[];
   created_at?: string;
   updated_at?: string;
@@ -145,16 +145,39 @@ export interface RegisteredShop {
   updated_at?: string;
 }
 
-export interface AuthUser {
-  id: string;
-  email: string;
-  role: 'shop_owner' | 'admin';
-  shop_id?: string;
-  name?: string;
-  created_at?: string;
-}
+// Auth operations: import from src/lib/auth (Milestone D1.2).
 
 // ─── Shop Operations ────────────────────────────────────────────────────────
+
+export class ShopFetchError extends Error {
+  readonly code?: string;
+
+  constructor(message: string, code?: string) {
+    super(message);
+    this.name = 'ShopFetchError';
+    this.code = code;
+  }
+}
+
+export type ShopPlan = 'basic' | 'standard' | 'premium';
+
+function normalizeShopPlan(plan: string | null | undefined): ShopPlan {
+  switch ((plan ?? 'standard').toLowerCase()) {
+    case 'free':
+    case 'basic':
+      return 'basic';
+    case 'starter':
+    case 'standard':
+      return 'standard';
+    case 'growth':
+    case 'enterprise':
+    case 'premium':
+    case 'pro':
+      return 'premium';
+    default:
+      return 'standard';
+  }
+}
 
 function mapDbShopToRegisteredShop(row: any): RegisteredShop {
   return {
@@ -171,7 +194,7 @@ function mapDbShopToRegisteredShop(row: any): RegisteredShop {
     username: row.username || '',
     password: row.password || '',
     status: row.status || 'active',
-    plan: row.plan || 'standard',
+    plan: normalizeShopPlan(row.plan),
     registeredOn: row.registered_on || '',
   };
 }
@@ -185,7 +208,7 @@ export async function fetchShops(): Promise<RegisteredShop[]> {
 
   if (error) {
     console.error('Error fetching shops:', error);
-    return [];
+    throw new ShopFetchError(error.message, error.code);
   }
 
   return (data || []).map(mapDbShopToRegisteredShop);
@@ -210,6 +233,56 @@ export async function fetchShopById(id: string): Promise<RegisteredShop | null> 
 }
 
 export async function addShop(shop: RegisteredShop): Promise<RegisteredShop | null> {
+  const useV2 = await shouldUseV2Provisioning();
+
+  if (useV2) {
+    return addShopV2(shop);
+  }
+
+  return addShopLegacy(shop);
+}
+
+async function shouldUseV2Provisioning(): Promise<boolean> {
+  try {
+    const { isFeatureEnabled, FEATURE_FLAGS } = await import('./infrastructure/feature-flag-client');
+    return await isFeatureEnabled(FEATURE_FLAGS.USE_V2_PROVISIONING);
+  } catch {
+    return false;
+  }
+}
+
+async function addShopV2(shop: RegisteredShop): Promise<RegisteredShop | null> {
+  try {
+    const { provisionShop } = await import('./provisioning');
+    const result = await provisionShop({
+      shopName: shop.shopName,
+      ownerName: shop.ownerName,
+      ownerEmail: shop.email,
+      phone: shop.phone,
+      address: shop.address || `${shop.city ?? ''}, ${shop.state ?? ''}`,
+      city: shop.city,
+      state: shop.state,
+      gst: shop.gstin,
+      category: shop.category,
+      plan: shop.plan,
+      username: shop.username,
+      temporaryPassword: shop.password,
+    });
+
+    return {
+      ...shop,
+      id: result.shopId,
+      username: result.username ?? shop.username,
+      password: result.temporaryPassword ?? shop.password,
+      status: 'active',
+    };
+  } catch (err) {
+    console.error('V2 provisioning failed:', err);
+    return null;
+  }
+}
+
+async function addShopLegacy(shop: RegisteredShop): Promise<RegisteredShop | null> {
   // Map RegisteredShop (camelCase) to Supabase schema (snake_case)
   const shopData = {
     id: shop.id,
@@ -521,12 +594,44 @@ function mapRefundUpdatesToDb(updates: Partial<Refund>) {
 
 function fromDbWastage(row: any): WastageEntry {
   return {
-    ...row,
+    id: row.id,
+    shop_id: row.shop_id,
+    date: row.date,
+    time: row.time,
+    productId: row.product_id,
+    productName: row.product_name,
+    productEmoji: row.product_emoji,
+    category: row.category,
+    batchNo: row.batch_no,
+    batchId: row.batch_id,
+    expiryDate: row.expiry_date,
+    quantity: Number(row.quantity),
+    costPrice: Number(row.cost_price),
+    totalLoss: Number(row.total_loss),
+    reason: row.reason,
+    notes: row.notes,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
   };
 }
 
-function toDbWastage(entry: Omit<WastageEntry, 'shop_id' | 'created_at' | 'updated_at'>) {
-  return { ...entry };
+function toDbWastage(entry: Omit<WastageEntry, 'shop_id' | 'created_at' | 'updated_at' | 'id'>) {
+  return {
+    date: entry.date,
+    time: entry.time,
+    product_id: entry.productId,
+    product_name: entry.productName,
+    product_emoji: entry.productEmoji,
+    category: entry.category,
+    batch_no: entry.batchNo,
+    batch_id: entry.batchId,
+    expiry_date: entry.expiryDate,
+    quantity: entry.quantity,
+    cost_price: entry.costPrice,
+    total_loss: entry.totalLoss,
+    reason: entry.reason,
+    notes: entry.notes,
+  };
 }
 
 export async function updateShop(id: string, updates: Partial<RegisteredShop>): Promise<boolean> {
@@ -563,6 +668,13 @@ export async function fetchProducts(shopId: string): Promise<Product[]> {
   return (data || []).map(fromDbProduct);
 }
 
+function formatProductInsertError(error: { code?: string; message?: string }): string {
+  if (error.code === '42501') {
+    return 'Permission denied: this account cannot add products to this shop.';
+  }
+  return error.message || 'Failed to add product.';
+}
+
 export async function addProduct(shopId: string, product: Omit<Product, 'id' | 'shop_id' | 'created_at'>): Promise<Product | null> {
   const dbProduct = toDbProduct({ ...product });
   const { data, error } = await supabase
@@ -572,9 +684,12 @@ export async function addProduct(shopId: string, product: Omit<Product, 'id' | '
 
   if (error) {
     console.error('Error adding product:', error);
-    return null;
+    throw new Error(formatProductInsertError(error));
   }
-  return data?.[0] ? fromDbProduct(data[0]) : null;
+  if (!data?.[0]) {
+    throw new Error('Product was created but could not be read back. Please refresh inventory.');
+  }
+  return fromDbProduct(data[0]);
 }
 
 export async function updateProduct(id: number, shopId: string, updates: Partial<Product>): Promise<boolean> {
@@ -753,20 +868,21 @@ export async function fetchWastage(shopId: string): Promise<WastageEntry[]> {
     console.error('Error fetching wastage:', error);
     return [];
   }
-  return data || [];
+  return (data || []).map(fromDbWastage);
 }
 
-export async function addWastage(shopId: string, entry: Omit<WastageEntry, 'shop_id' | 'created_at'>): Promise<WastageEntry | null> {
+export async function addWastage(shopId: string, entry: Omit<WastageEntry, 'shop_id' | 'created_at' | 'id'>): Promise<WastageEntry | null> {
+  const dbEntry = toDbWastage(entry);
   const { data, error } = await supabase
     .from('wastage_entries')
-    .insert([{ ...entry, shop_id: shopId }])
+    .insert([{ ...dbEntry, shop_id: shopId }])
     .select();
 
   if (error) {
     console.error('Error adding wastage entry:', error);
     return null;
   }
-  return data?.[0] || null;
+  return data?.[0] ? fromDbWastage(data[0]) : null;
 }
 
 // ─── Drawer Operations ─────────────────────────────────────────────────────
@@ -783,26 +899,45 @@ export async function fetchDrawerDay(shopId: string, date: string): Promise<Draw
     console.error('Error fetching drawer day:', error);
     return null;
   }
-  return data || null;
+  if (!data) return null;
+
+  const transactions = await fetchDrawerTransactions(data.id);
+  return fromDbDrawerDay(data, transactions);
 }
 
 export async function createDrawerDay(shopId: string, drawerDay: Omit<DrawerDay, 'id' | 'created_at' | 'transactions'>): Promise<DrawerDay | null> {
+  const d = drawerDay as Record<string, unknown>;
   const { data, error } = await supabase
     .from('drawer_days')
-    .insert([{ ...drawerDay, shop_id: shopId, transactions: [] }])
+    .insert([{
+      shop_id: shopId,
+      date: d.date,
+      opening_balance: (d.openingBalance ?? d.opening_balance ?? 0) as number,
+      closing_balance: (d.closingBalance ?? d.closing_balance ?? null) as number | null,
+      transactions: [],
+    }])
     .select();
 
   if (error) {
     console.error('Error creating drawer day:', error);
     return null;
   }
-  return data?.[0] || null;
+  return data?.[0] ? fromDbDrawerDay(data[0]) : null;
 }
 
 export async function updateDrawerDay(id: string, shopId: string, updates: Partial<DrawerDay>): Promise<boolean> {
+  const dbUpdates: Record<string, unknown> = {};
+  if (updates.openingBalance !== undefined) dbUpdates.opening_balance = updates.openingBalance;
+  if (updates.closingBalance !== undefined) dbUpdates.closing_balance = updates.closingBalance;
+  if (updates.date !== undefined) dbUpdates.date = updates.date;
+
+  if (Object.keys(dbUpdates).length === 0) {
+    return true;
+  }
+
   const { error } = await supabase
     .from('drawer_days')
-    .update(updates)
+    .update(dbUpdates)
     .eq('id', id)
     .eq('shop_id', shopId);
 
@@ -814,16 +949,51 @@ export async function updateDrawerDay(id: string, shopId: string, updates: Parti
 }
 
 export async function addDrawerTransaction(shopId: string, drawerDayId: string, tx: Omit<DrawerTx, 'id' | 'created_at'>): Promise<DrawerTx | null> {
+  const dbTx = {
+    ...tx,
+    id: `DTX-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+  } as any;
   const { data, error } = await supabase
     .from('drawer_transactions')
-    .insert([{ ...tx, shop_id: shopId, drawer_day_id: drawerDayId }])
+    .insert([{ ...dbTx, shop_id: shopId, drawer_day_id: drawerDayId }])
     .select();
 
   if (error) {
     console.error('Error adding drawer transaction:', error);
     return null;
   }
-  return data?.[0] || null;
+  return data?.[0] ? fromDbDrawerTx(data[0]) : null;
+}
+
+function fromDbDrawerTx(row: any): DrawerTx {
+  return {
+    id: row.id,
+    shop_id: row.shop_id,
+    date: row.date,
+    time: row.time,
+    type: row.type,
+    description: row.description,
+    amount: Number(row.amount),
+    balance: Number(row.balance),
+    created_at: row.created_at,
+  };
+}
+
+function fromDbDrawerDay(row: any, transactions?: DrawerTx[]): DrawerDay {
+  const legacyTx = Array.isArray(row.transactions)
+    ? row.transactions.map(fromDbDrawerTx)
+    : [];
+
+  return {
+    id: row.id,
+    shop_id: row.shop_id,
+    date: row.date,
+    openingBalance: Number(row.opening_balance ?? row.openingBalance ?? 0),
+    closingBalance: (row.closing_balance ?? row.closingBalance) ?? null,
+    transactions: transactions ?? legacyTx,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
 }
 
 export async function fetchDrawerTransactions(drawerDayId: string): Promise<DrawerTx[]> {
@@ -837,7 +1007,7 @@ export async function fetchDrawerTransactions(drawerDayId: string): Promise<Draw
     console.error('Error fetching drawer transactions:', error);
     return [];
   }
-  return data || [];
+  return (data || []).map(fromDbDrawerTx);
 }
 
 // ─── Inventory Management ──────────────────────────────────────────────────
@@ -1011,7 +1181,7 @@ export async function createRefundWithInventory(
   items: CartItem[]
 ): Promise<Refund | null> {
   try {
-    const dbRefund = toDbRefund(refund);
+    const dbRefund = toDbRefund({ ...refund, items });
 
     const { data, error } = await supabase
       .from('refunds')
@@ -1036,53 +1206,4 @@ export async function createRefundWithInventory(
     console.error('Error in createRefundWithInventory:', err);
     return null;
   }
-}
-
-// ─── Auth Operations ──────────────────────────────────────────────────────
-
-export async function signIn(email: string, password: string): Promise<AuthUser | null> {
-  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-  if (error || !data?.user) {
-    console.error('Error signing in:', error);
-    return null;
-  }
-  return await getAuthUser();
-}
-
-export async function signOut(): Promise<boolean> {
-  const { error } = await supabase.auth.signOut();
-  if (error) {
-    console.error('Error signing out:', error);
-    return false;
-  }
-  return true;
-}
-
-export async function getAuthUser(): Promise<AuthUser | null> {
-  const { data: { user }, error } = await supabase.auth.getUser();
-  
-  if (error || !user) {
-    return null;
-  }
-
-  // Fetch user profile with shop association and role
-  const { data: profile, error: profileError } = await supabase
-    .from('user_profiles')
-    .select('*')
-    .eq('id', user.id)
-    .single();
-
-  if (profileError) {
-    console.error('Error fetching user profile:', profileError);
-    return null;
-  }
-
-  return {
-    id: user.id,
-    email: user.email || '',
-    shop_id: profile?.shop_id || undefined,
-    role: profile?.role || 'shop_owner',
-    name: profile?.full_name || (user.user_metadata as any)?.full_name || user.email || '',
-    created_at: profile?.created_at,
-  };
 }
