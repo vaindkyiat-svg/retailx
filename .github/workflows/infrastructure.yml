@@ -1,0 +1,112 @@
+name: Infrastructure CI
+
+on:
+  push:
+    branches: [main, develop, 'milestone/**']
+    paths:
+      - 'supabase/**'
+      - 'scripts/infrastructure/**'
+      - 'src/lib/infrastructure/**'
+      - '.github/workflows/infrastructure.yml'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'supabase/**'
+      - 'scripts/infrastructure/**'
+      - 'src/lib/infrastructure/**'
+
+jobs:
+  validate:
+    name: Validate migrations & unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Validate migration files
+        run: node scripts/infrastructure/validate.mjs
+
+      - name: Run infrastructure unit tests
+        run: node scripts/infrastructure/test.mjs
+
+  integration:
+    name: Database integration tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/milestone/'))
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: retailx_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Bootstrap V1 tables for FK references
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/retailx_test
+          RETAILX_ENV: development
+        run: node scripts/infrastructure/bootstrap.mjs
+
+      - name: Apply migrations
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/retailx_test
+          RETAILX_ENV: development
+        run: node scripts/infrastructure/migrate.mjs
+
+      - name: Run seeds
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/retailx_test
+          RETAILX_ENV: development
+        run: node scripts/infrastructure/seed.mjs
+
+      - name: Load V1 test fixture
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/retailx_test
+          RETAILX_ENV: development
+        run: node -e "import pg from 'pg';import {readFileSync} from 'fs';const c=new pg.Client({connectionString:process.env.DATABASE_URL});await c.connect();await c.query(readFileSync('supabase/tests/fixtures/v1_sample.sql','utf8'));await c.end();"
+
+      - name: Run C1 backfill
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/retailx_test
+          RETAILX_ENV: development
+        run: node scripts/infrastructure/backfill.mjs
+
+      - name: Run C2 health check
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/retailx_test
+          RETAILX_ENV: development
+        run: node scripts/infrastructure/health.mjs --trigger ci --format json
+
+      - name: Run C3 cutover simulation
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/retailx_test
+          RETAILX_ENV: development
+        run: node scripts/infrastructure/cutover.mjs --fixture
+
+      - name: Run integration tests
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/retailx_test
+          RETAILX_ENV: development
+        run: node scripts/infrastructure/test.mjs

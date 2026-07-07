@@ -1,0 +1,23 @@
+{
+  "$schema": "./environments.schema.json",
+  "development": {
+    "description": "Local Supabase or dev project",
+    "databaseUrlEnv": "DATABASE_URL",
+    "fallbackUrlEnv": "VITE_SUPABASE_URL",
+    "requireSsl": false,
+    "allowDestructiveSeed": true
+  },
+  "staging": {
+    "description": "Staging Supabase project",
+    "databaseUrlEnv": "STAGING_DATABASE_URL",
+    "requireSsl": true,
+    "allowDestructiveSeed": false
+  },
+  "production": {
+    "description": "Production Supabase project",
+    "databaseUrlEnv": "PRODUCTION_DATABASE_URL",
+    "requireSsl": true,
+    "allowDestructiveSeed": false,
+    "requireConfirmation": true
+  }
+}

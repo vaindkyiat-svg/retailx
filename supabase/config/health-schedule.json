@@ -1,0 +1,30 @@
+{
+  "schedules": {
+    "manual": {
+      "description": "On-demand via npm run db:health",
+      "enabled": true
+    },
+    "daily": {
+      "description": "Daily health check at 02:00 UTC",
+      "enabled": false,
+      "cron": "0 2 * * *",
+      "command": "node scripts/infrastructure/health.mjs --trigger daily"
+    },
+    "weekly": {
+      "description": "Weekly deep validation Sunday 03:00 UTC",
+      "enabled": false,
+      "cron": "0 3 * * 0",
+      "command": "node scripts/infrastructure/health.mjs --trigger weekly --full"
+    },
+    "ci": {
+      "description": "Run on every infrastructure CI pipeline",
+      "enabled": true,
+      "command": "node scripts/infrastructure/health.mjs --trigger ci --format json"
+    }
+  },
+  "thresholds": {
+    "healthy": 99.5,
+    "degraded": 90.0,
+    "unhealthy": 0
+  }
+}

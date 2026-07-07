@@ -268,7 +268,20 @@ const SEED_ORDERS: Order[] = [
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-const fmt = (n: number) => `₹${n.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+const fmt = (n: number | null | undefined) =>
+  `₹${(n ?? 0).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+/** Normalize drawer day fields that may arrive as snake_case or nullish from the DB mapper. */
+function drawerClosingBalance(day: DrawerDay | null): number | null {
+  if (!day) return null;
+  const raw = day as DrawerDay & { closing_balance?: number | null };
+  const v = raw.closingBalance ?? raw.closing_balance;
+  return v === undefined ? null : v;
+}
+
+function drawerTransactions(day: DrawerDay | null): DrawerTx[] {
+  return day?.transactions ?? [];
+}
 const today = () => new Date().toLocaleDateString("en-IN", { day: "2-digit", month: "long", year: "numeric" });
 const nowTime = () => new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true });
 
@@ -3511,10 +3524,10 @@ function DrawerPanel({
   const [tab, setTab] = useState<"summary" | "history">("summary");
   const [txError, setTxError] = useState("");
 
-  const isOpen = drawerDay !== null && drawerDay.closingBalance === null;
-  const currentBalance = drawerDay
-    ? drawerDay.transactions.reduce((s, t) => s + t.amount, 0)
-    : 0;
+  const closingBalance = drawerClosingBalance(drawerDay);
+  const transactions = drawerTransactions(drawerDay);
+  const isOpen = drawerDay !== null && closingBalance === null;
+  const currentBalance = transactions.reduce((s, t) => s + t.amount, 0);
 
   const handleOpen = () => { onOpenDrawer(parseFloat(openingInput) || 0); };
 
@@ -3570,11 +3583,11 @@ function DrawerPanel({
             <div className="flex gap-4 mt-2 text-xs text-muted-foreground">
               <span className="flex items-center gap-1 text-accent">
                 <ArrowUpRight size={11} />
-                In: {fmt(drawerDay!.transactions.filter(t => t.amount > 0).reduce((s, t) => s + t.amount, 0))}
+                In: {fmt(transactions.filter(t => t.amount > 0).reduce((s, t) => s + t.amount, 0))}
               </span>
               <span className="flex items-center gap-1 text-destructive">
                 <ArrowDownLeft size={11} />
-                Out: {fmt(Math.abs(drawerDay!.transactions.filter(t => t.amount < 0).reduce((s, t) => s + t.amount, 0)))}
+                Out: {fmt(Math.abs(transactions.filter(t => t.amount < 0).reduce((s, t) => s + t.amount, 0)))}
               </span>
             </div>
           </div>
@@ -3604,11 +3617,11 @@ function DrawerPanel({
           )}
 
           {/* Drawer closed for today */}
-          {drawerDay && drawerDay.closingBalance !== null && (
+          {drawerDay && closingBalance !== null && (
             <div className="p-5 text-center space-y-3">
               <Lock size={32} className="mx-auto text-muted-foreground/40" />
               <p className="font-semibold">Drawer Closed</p>
-              <p className="text-sm text-muted-foreground">Closing balance: <span className="font-mono font-bold text-primary">{fmt(drawerDay.closingBalance)}</span></p>
+              <p className="text-sm text-muted-foreground">Closing balance: <span className="font-mono font-bold text-primary">{fmt(closingBalance)}</span></p>
               <p className="text-xs text-muted-foreground">The drawer was closed for today. Open a new drawer tomorrow.</p>
             </div>
           )}
@@ -3664,7 +3677,7 @@ function DrawerPanel({
                   <div>
                     <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">Today's Activity</p>
                     <div className="space-y-1.5">
-                      {[...drawerDay!.transactions].reverse().slice(0, 8).map(tx => (
+                      {[...transactions].reverse().slice(0, 8).map(tx => (
                         <div key={tx.id} className="flex items-center gap-3 py-2 border-b border-border/40 last:border-0">
                           <div className={`p-1.5 rounded-lg ${tx.amount >= 0 ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"}`}>
                             {txIcon(tx.type)}
@@ -3681,7 +3694,7 @@ function DrawerPanel({
                           </div>
                         </div>
                       ))}
-                      {drawerDay!.transactions.length === 0 && (
+                      {transactions.length === 0 && (
                         <p className="text-center text-xs text-muted-foreground py-4">No transactions yet today</p>
                       )}
                     </div>
@@ -3691,7 +3704,7 @@ function DrawerPanel({
 
               {tab === "history" && (
                 <div className="space-y-1.5">
-                  {[...drawerDay!.transactions].reverse().map(tx => (
+                  {[...transactions].reverse().map(tx => (
                     <div key={tx.id} className="flex items-start gap-3 py-2.5 border-b border-border/40 last:border-0">
                       <div className={`p-1.5 rounded-lg mt-0.5 flex-shrink-0 ${tx.amount >= 0 ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"}`}>
                         {txIcon(tx.type)}
@@ -4431,8 +4444,10 @@ export default function App() {
   // ── Drawer helpers ───────────────────────────────────────────────────────
 
   const drawerBalance = useMemo(() => {
-    if (!drawerDay || drawerDay.closingBalance !== null) return null;
-    return drawerDay.transactions.reduce((s, t) => s + t.amount, 0);
+    if (!drawerDay) return null;
+    const closing = drawerClosingBalance(drawerDay);
+    if (closing !== null) return null;
+    return drawerTransactions(drawerDay).reduce((s, t) => s + t.amount, 0);
   }, [drawerDay]);
 
   const handleWithdraw = useCallback((amount: number, note: string) => {
